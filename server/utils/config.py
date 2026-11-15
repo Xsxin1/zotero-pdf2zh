@@ -183,6 +183,12 @@ class Config:
             if self.service in [None, ''] or len(self.service) < 3:
                 self.service = 'siliconflowfree'
 
+        # `auto` asks the server to probe the configured services and use the
+        # first healthy one. It is resolved right before translation, once the
+        # translation environment exists; until then it must never be treated as
+        # a real service name.
+        self.auto_service = str(self.service or '').strip().lower() == 'auto'
+
         self.sourceLang = request_data.get('sourceLang', 'en')
         if self.sourceLang in [None, ''] or len(self.sourceLang) < 2:
             self.sourceLang = 'en'

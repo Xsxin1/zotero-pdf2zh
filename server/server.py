@@ -18,6 +18,12 @@ from utils.environment_lifecycle import (
 )
 from utils.config import Config, clear_saved_credential
 from utils.config_map import pdf2zh_next_service_aliases
+from utils.service_probe import (
+    collect_candidates,
+    format_report,
+    pick_service,
+    probe_services,
+)
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
 import traceback
@@ -139,6 +145,13 @@ class PDFTranslator:
         self.app.add_url_rule('/api/tasks', 'tasks', self.get_tasks)
         # 新增：配置信息 API - 供 index.html 前端显示当前服务配置
         self.app.add_url_rule('/api/config', 'config', self.get_config)
+        # 新增：翻译服务可用性检测 API
+        self.app.add_url_rule(
+            '/api/services/check',
+            'check_services',
+            self.check_services,
+            methods=['GET', 'POST'],
+        )
         # 新增：清除某个服务保存在配置文件里的 API Key（插件删除 LLM API 配置时调用）
         self.app.add_url_rule('/api/llm-api/clear', 'llm_api_clear', self.llm_api_clear, methods=['POST'])
         # 新增：favicon 路由
@@ -222,6 +235,41 @@ class PDFTranslator:
             'enable_winexe': args.enable_winexe,
         }
         return jsonify({'status': 'success', 'config': config_info})
+
+    ##################################################################
+    # 翻译服务可用性检测 API /api/services/check
+    # 用与真实翻译相同的翻译器逐个探测，返回每个服务的真实可用性
+    ##################################################################
+    def check_services(self):
+        try:
+            payload = request.get_json(silent=True) or {}
+            lang_in = payload.get('sourceLang') or 'en'
+            lang_out = payload.get('targetLang') or 'zh-CN'
+
+            try:
+                with open(config_path[pdf2zh_next], 'r', encoding='utf-8') as f:
+                    loaded = toml.load(f)
+            except Exception as exc:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'无法读取翻译服务配置: {exc}',
+                }), 500
+
+            candidates = collect_candidates(loaded)
+            results = probe_services(
+                candidates,
+                lang_in=lang_in,
+                lang_out=lang_out,
+                env_manager=self.env_manager if args.enable_venv else None,
+            )
+            chosen = pick_service(candidates, results)
+            return jsonify({
+                'status': 'success',
+                'recommended': chosen,
+                'services': results,
+            })
+        except Exception as exc:
+            return self._handle_exception(exc, context='/api/services/check')
 
     ##################################################################
     # 清除已保存的密钥 API /api/llm-api/clear
@@ -361,7 +409,9 @@ class PDFTranslator:
         model_name = config.llm_api.get('model', '')
         service = config.service
         if not model_name:
-            if service == 'siliconflowfree':
+            if getattr(config, 'auto_service', False):
+                model_name = '自动选择中...'
+            elif service == 'siliconflowfree':
                 model_name = 'siliconflowfree (免费服务)'
             elif service == 'bing':
                 model_name = 'Bing 翻译'
@@ -1085,6 +1135,14 @@ class PDFTranslator:
 
     def translate_pdf(self, input_path, config, task_id=None):
         # TODO: 如果翻译失败了, 自动执行跳过字体子集化, 并且显示生成的文件的大小
+        # The legacy engine only ships machine-translation backends, and its
+        # config.json/venv health checks do not cover them the way the new engine
+        # does. Auto-selection is therefore not meaningful here: fall back to the
+        # documented default instead of probing with the wrong tooling.
+        if getattr(config, 'auto_service', False):
+            print("ℹ️ 旧版 pdf2zh 引擎不支持自动选择，回退到默认服务 bing")
+            config.service = 'bing'
+            config.auto_service = False
         config.update_config_file(config_path[pdf2zh])
         if config.targetLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
             config.targetLang = 'zh'
@@ -1138,7 +1196,65 @@ class PDFTranslator:
             raise RuntimeError("翻译进程结束但未生成预期 PDF，请查看翻译日志。")
         return existing
 
+    def resolve_auto_service(self, config, task_id=None):
+        """Replace ``service=auto`` with the first healthy configured service.
+
+        Probing happens here rather than at request time so a failure can be
+        reported with the full per-service report instead of a generic engine
+        error, and so the plugin's own selection semantics stay untouched.
+        """
+        if not getattr(config, 'auto_service', False):
+            return config.service
+
+        if task_id is not None:
+            task_manager.update_task(task_id, {
+                'status': 'running',
+                'message': '正在检测可用翻译服务...',
+            })
+
+        try:
+            with open(config_path[pdf2zh_next], 'r', encoding='utf-8') as f:
+                loaded = toml.load(f)
+        except Exception as exc:
+            raise RuntimeError(f'无法读取翻译服务配置以执行自动检测: {exc}') from exc
+
+        candidates = collect_candidates(loaded)
+        print(f"\n🔎 [自动选择] 待检测服务: {[c['service'] for c in candidates]}")
+        if not candidates:
+            raise RuntimeError(
+                '没有找到已配置的翻译服务。请在插件设置中选择具体服务并填写 API Key，'
+                '或至少使用免费的 bing / google 服务。'
+            )
+
+        results = probe_services(
+            candidates,
+            lang_in=config.sourceLang,
+            lang_out=config.targetLang,
+            env_manager=self.env_manager if args.enable_venv else None,
+        )
+        detail = format_report(results)
+        print(detail)
+
+        chosen = pick_service(candidates, results)
+        if not chosen:
+            raise RuntimeError(
+                '所有翻译服务均不可用，无法自动选择。检测结果:\n' + detail
+            )
+
+        config.service = chosen
+        print(f"✅ [自动选择] 使用服务: {chosen}\n")
+        if task_id is not None:
+            # Surface the decision in the plugin/web UI: the user picked "auto",
+            # so they need to see which service actually handled the file.
+            task_manager.update_task(task_id, {
+                'service': chosen,
+                'message': f'已自动选择服务: {chosen}',
+                'serviceReport': results,
+            })
+        return chosen
+
     def translate_pdf_next(self, input_path, config, task_id=None):
+        self.resolve_auto_service(config, task_id)
         validate_table_runtime(
             config.table_mode, engine=pdf2zh_next,
             winexe=args.enable_winexe and os.path.exists(args.winexe_path),
